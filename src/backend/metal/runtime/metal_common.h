@@ -358,13 +358,13 @@ class MetalThreadEntry {
    * \brief Pool of staging buffers for CPU→GPU copies that are inlined
    * into the pending command buffer. Each inlined copy needs its own
    * staging buffer because the GPU reads them asynchronously.
-   * Buffers are recycled after FlushCommandBuffer()/Synchronize().
+   * Buffers are recycled only after Synchronize() (the GPU must have finished reading them).
    */
   struct StagingBufferPool {
    public:
     /*! \brief Maximum staging buffers before requiring a flush.
      * Prevents unbounded pool growth in workloads with many CPU→GPU copies
-     * between syncs. When this limit is reached, the caller must flush the
+     * between syncs. When this limit is reached, the caller must synchronize the
      * stream (to make all pending staging buffers safe to reuse) before
      * requesting more buffers. */
     static constexpr size_t kMaxStagingBuffers = 64;

@@ -281,9 +281,11 @@ void MetalWorkspace::CopyDataFromTo(const void* from, size_t from_offset, void* 
       id<MTLBuffer> to_buf = (id<MTLBuffer>)(to);
       if (to_buf.storageMode != MTLStorageModeShared) {
         MetalThreadEntry* t = MetalThreadEntry::ThreadLocal();
-        // If the staging pool is full, flush pending work so buffers can be reused.
+        // If the staging pool is full, wait for pending work so buffers can be reused.
+        // Committing alone is not enough: the GPU may not have read the staging
+        // buffers yet, and the next memcpy would overwrite them.
         if (t->StagingPoolNeedsFlush(dev_to)) {
-          s->FlushCommandBuffer();
+          s->Synchronize();
           t->ResetStagingPool(dev_to);
         }
         id<MTLBuffer> staging = t->GetOrCreateStagingBuffer(dev_to, size);
