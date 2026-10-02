@@ -40,6 +40,7 @@
 #include <tvm/runtime/tensor.h>
 #include <tvm/runtime/vm/tensor_cache_support.h>
 
+#include <future>
 #include <string>
 #include <vector>
 
@@ -151,22 +152,65 @@ void CopyTensorFromBytes(Tensor param, const void* data, size_t nbytes,
   DeviceAPI::Get(device)->StreamSync(device, nullptr);
 }
 
-Tensor TensorCacheMetadata::FileRecord::ParamRecord::Load(
-    Device device, const std::string* raw_data, ffi::Optional<Tensor>* staging_buffer) const {
-  Tensor arr = Tensor::Empty(shape, dtype, device);
-  if (dtype == DLDataType{kDLFloat, 32, 1} && format == "f32-to-bf16") {
-    // decode bf16 to f32
-    std::vector<uint16_t> buffer(nbytes / 2);
-    std::vector<uint32_t> decoded(nbytes / 2);
-    std::memcpy(buffer.data(), raw_data->data() + byte_offset, nbytes);
-    for (size_t i = 0; i < buffer.size(); ++i) {
+/*!
+ * \brief Load a parameter without waiting for the host-to-device copy to finish.
+ * The copy may still read from `raw_data` after this returns, so the caller must
+ * keep `raw_data` alive and unmodified until it synchronizes the device stream.
+ * Syncing once per file instead of once per tensor lets backends such as Metal
+ * batch the uploads instead of round-tripping to the GPU for every tensor.
+ */
+static Tensor LoadParamWithoutSync(const TensorCacheMetadata::FileRecord::ParamRecord& rec,
+                                   Device device, const std::string* raw_data,
+                                   ffi::Optional<Tensor>* staging_buffer) {
+  Tensor arr = Tensor::Empty(rec.shape, rec.dtype, device);
+  const char* data = raw_data->data() + rec.byte_offset;
+  if (rec.dtype == DLDataType{kDLFloat, 32, 1} && rec.format == "f32-to-bf16") {
+    // decode bf16 to f32; `decoded` is local, so this copy must be synchronous
+    const uint16_t* buffer = reinterpret_cast<const uint16_t*>(data);
+    std::vector<uint32_t> decoded(rec.nbytes / 2);
+    for (size_t i = 0; i < decoded.size(); ++i) {
       decoded[i] = static_cast<uint32_t>(buffer[i]) << 16;
     }
     CopyTensorFromBytes(arr, decoded.data(), decoded.size() * sizeof(uint32_t), staging_buffer);
+  } else if (device.device_type == kDLOpenCL && staging_buffer != nullptr) {
+    CopyTensorFromBytes(arr, data, rec.nbytes, staging_buffer);
   } else {
-    CopyTensorFromBytes(arr, raw_data->data() + byte_offset, nbytes, staging_buffer);
+    TVM_FFI_ICHECK_EQ(ffi::GetDataSize(*arr.operator->()), static_cast<size_t>(rec.nbytes))
+        << "Size mismatch when loading parameter " << rec.name;
+    DLTensor from = *arr.operator->();
+    from.data = const_cast<char*>(data);
+    from.device = Device{kDLCPU, 0};
+    from.strides = nullptr;
+    from.byte_offset = 0;
+    DeviceAPI::Get(device)->CopyDataFromTo(&from, const_cast<DLTensor*>(arr.operator->()),
+                                           nullptr);
   }
   return arr;
+}
+
+Tensor TensorCacheMetadata::FileRecord::ParamRecord::Load(
+    Device device, const std::string* raw_data, ffi::Optional<Tensor>* staging_buffer) const {
+  Tensor arr = LoadParamWithoutSync(*this, device, raw_data, staging_buffer);
+  DeviceAPI::Get(device)->StreamSync(device, nullptr);
+  return arr;
+}
+
+/*! \brief Load all parameters of a file whose contents are already in `raw_data`. */
+static ffi::Array<Tensor> LoadFileRecordFromBuffer(const TensorCacheMetadata::FileRecord& file,
+                                                   Device device, const std::string* raw_data,
+                                                   ffi::Optional<Tensor>* staging_buffer) {
+  TVM_FFI_CHECK_EQ(file.format, "raw-shard", ValueError) << "Only `raw-shard` format is supported";
+  TVM_FFI_CHECK_EQ(file.nbytes, raw_data->length(), ValueError)
+      << "Encountered an corrupted parameter shard. It means it is not downloaded "
+         "completely or downloading is interrupted. Please try to download again.";
+  ffi::Array<Tensor> result;
+  result.reserve(file.records.size());
+  for (const auto& nd_rec : file.records) {
+    result.push_back(LoadParamWithoutSync(nd_rec, device, raw_data, staging_buffer));
+  }
+  // Wait for all copies from `raw_data` before the caller reuses it.
+  DeviceAPI::Get(device)->StreamSync(device, nullptr);
+  return result;
 }
 
 TVM_RUNTIME_DLL ffi::Array<Tensor> TensorCacheMetadata::FileRecord::Load(
@@ -175,16 +219,7 @@ TVM_RUNTIME_DLL ffi::Array<Tensor> TensorCacheMetadata::FileRecord::Load(
     std::string* raw_data_buffer,    //
     ffi::Optional<Tensor>* staging_buffer) const {
   LoadBinaryFromFile(path_prefix + "/" + this->data_path, raw_data_buffer);
-  TVM_FFI_CHECK_EQ(this->format, "raw-shard", ValueError) << "Only `raw-shard` format is supported";
-  TVM_FFI_CHECK_EQ(this->nbytes, raw_data_buffer->length(), ValueError)
-      << "Encountered an corrupted parameter shard. It means it is not downloaded "
-         "completely or downloading is interrupted. Please try to download again.";
-  ffi::Array<Tensor> result;
-  result.reserve(this->records.size());
-  for (const ParamRecord& nd_rec : this->records) {
-    result.push_back(nd_rec.Load(device, raw_data_buffer, staging_buffer));
-  }
-  return result;
+  return LoadFileRecordFromBuffer(*this, device, raw_data_buffer, staging_buffer);
 }
 
 /*!
@@ -233,11 +268,27 @@ class TensorCache {
     DLDevice device{static_cast<DLDeviceType>(device_type), device_id};
     TensorCacheMetadata metadata = TensorCacheMetadata::Load(cache_path);
     ffi::Optional<Tensor> staging_buffer;
-    std::string raw_data;
+    // Double buffering: file i+1 is read from disk on a background thread while
+    // file i is uploaded to the device.
+    std::string raw_data[2];
+    std::future<void> next_file_read;  // declared after raw_data so it is joined first
+    auto read_file = [&](size_t i) {
+      LoadBinaryFromFile(cache_path + "/" + metadata.records[i].data_path, &raw_data[i % 2]);
+    };
     ffi::Array<Tensor> params;
-    for (const TensorCacheMetadata::FileRecord& shard_rec : metadata.records) {
+    for (size_t i = 0; i < metadata.records.size(); ++i) {
+      const TensorCacheMetadata::FileRecord& shard_rec = metadata.records[i];
       try {
-        params = shard_rec.Load(device, cache_path, &raw_data, &staging_buffer);
+        if (i == 0) {
+          read_file(0);
+        } else {
+          next_file_read.get();
+        }
+        // The other buffer held file i-1, whose upload has completed.
+        if (i + 1 < metadata.records.size()) {
+          next_file_read = std::async(std::launch::async, read_file, i + 1);
+        }
+        params = LoadFileRecordFromBuffer(shard_rec, device, &raw_data[i % 2], &staging_buffer);
       } catch (const std::runtime_error& e) {
         TVM_FFI_THROW(ValueError) << "Error when loading parameters from " << shard_rec.data_path
                                   << ": " << e.what();
