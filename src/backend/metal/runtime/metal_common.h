@@ -315,6 +315,17 @@ class MetalWorkspace final : public DeviceAPI {
   void SetDevice(Device dev) final;
   void GetAttr(Device dev, DeviceAttrKind kind, ffi::Any* rv) final;
   void* AllocDataSpace(Device dev, size_t nbytes, size_t alignment, DLDataType type_hint) final;
+  /*!
+   * \brief Allocate with a memory scope. "metal.shared_storage" requests a buffer in
+   * MTLStorageModeShared on GPUs with unified memory (falls back to private storage otherwise).
+   * The CPU can then write it directly, without a staging buffer and a GPU blit.
+   *
+   * \note A host-to-device copy into a shared buffer is an immediate memcpy that is not ordered
+   * with GPU work still pending on the stream. Only use this scope for data that queued GPU
+   * work does not access while the CPU writes it, such as weights written once at load time.
+   */
+  void* AllocDataSpace(Device dev, int ndim, const int64_t* shape, DLDataType dtype,
+                       ffi::Optional<ffi::String> mem_scope) final;
   void FreeDataSpace(Device dev, void* ptr) final;
   TVMStreamHandle CreateStream(Device dev) final;
   void FreeStream(Device dev, TVMStreamHandle stream) final;

@@ -162,7 +162,12 @@ void CopyTensorFromBytes(Tensor param, const void* data, size_t nbytes,
 static Tensor LoadParamWithoutSync(const TensorCacheMetadata::FileRecord::ParamRecord& rec,
                                    Device device, const std::string* raw_data,
                                    ffi::Optional<Tensor>* staging_buffer) {
-  Tensor arr = Tensor::Empty(rec.shape, rec.dtype, device);
+  // On Metal, weights go into shared storage when the GPU has unified memory, so the upload
+  // is one memcpy instead of a staging copy plus a GPU blit. Weights are written only here,
+  // before any GPU work reads them. GPU read bandwidth is the same as private storage.
+  Tensor arr = device.device_type == kDLMetal
+                   ? Tensor::Empty(rec.shape, rec.dtype, device, ffi::String("metal.shared_storage"))
+                   : Tensor::Empty(rec.shape, rec.dtype, device);
   const char* data = raw_data->data() + rec.byte_offset;
   if (rec.dtype == DLDataType{kDLFloat, 32, 1} && rec.format == "f32-to-bf16") {
     // decode bf16 to f32; `decoded` is local, so this copy must be synchronous

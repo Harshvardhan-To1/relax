@@ -199,6 +199,33 @@ void* MetalWorkspace::AllocDataSpace(Device device, size_t nbytes, size_t alignm
   return (void*)(buf);
 }
 
+void* MetalWorkspace::AllocDataSpace(Device device, int ndim, const int64_t* shape,
+                                     DLDataType dtype, ffi::Optional<ffi::String> mem_scope) {
+  if (mem_scope.has_value() && mem_scope.value() == "metal.shared_storage") {
+    id<MTLBuffer> buf = nil;
+    AUTORELEASEPOOL {
+      id<MTLDevice> dev = GetDevice(device);
+      if (dev.hasUnifiedMemory) {
+        DLTensor temp;
+        temp.data = nullptr;
+        temp.device = device;
+        temp.ndim = ndim;
+        temp.dtype = dtype;
+        temp.shape = const_cast<int64_t*>(shape);
+        temp.strides = nullptr;
+        temp.byte_offset = 0;
+        size_t nbytes = std::max<size_t>(ffi::GetDataSize(temp), 1);
+        buf = [dev newBufferWithLength:nbytes options:MTLResourceStorageModeShared];
+        TVM_FFI_ICHECK(buf != nil);
+      }
+    };
+    if (buf != nil) return (void*)(buf);
+    // Without unified memory, shared storage would be slow for the GPU to read.
+    mem_scope = std::nullopt;
+  }
+  return DeviceAPI::AllocDataSpace(device, ndim, shape, dtype, mem_scope);
+}
+
 void MetalWorkspace::FreeDataSpace(Device dev, void* ptr) {
   AUTORELEASEPOOL {
     Stream* s = CastStreamOrGetDefault(nullptr, dev.device_id);
